@@ -18,7 +18,8 @@ const SkillBridgeApp = () => {
   const [hoveredPath, setHoveredPath] = useState(null);
   const [fps, setFps] = useState(22);
 const [completedNodes, setCompletedNodes] = useState([]);
-
+  const [skillProgress, setSkillProgress] = useState({});
+  // skillProgress structure: { [skillId]: { quickWins: [true, false, ...], challenges: [true, false, ...], project: false } }
 
   const [showCognitiveBreak, setShowCognitiveBreak] = useState(false);
   const [simulationActive, setSimulationActive] = useState(false);
@@ -27,6 +28,67 @@ const [completedNodes, setCompletedNodes] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [selectedScenario, setSelectedScenario] = useState(null);
   const [selectedSkillNode, setSelectedSkillNode] = useState(null);
+  const [showMetricExplanation, setShowMetricExplanation] = useState(null);
+  const [skillCategoryFilter, setSkillCategoryFilter] = useState('all');
+  const [trainingContent, setTrainingContent] = useState(null);
+  const [loadingTraining, setLoadingTraining] = useState(false);
+
+  // Load progress from localStorage on mount
+  React.useEffect(() => {
+    try {
+      const saved = localStorage.getItem('skillBridgeProgress');
+      if (saved) {
+        setSkillProgress(JSON.parse(saved));
+      }
+    } catch (error) {
+      console.error('Failed to load progress:', error);
+    }
+  }, []);
+
+  // Save progress to localStorage whenever it changes
+  React.useEffect(() => {
+    try {
+      localStorage.setItem('skillBridgeProgress', JSON.stringify(skillProgress));
+    } catch (error) {
+      console.error('Failed to save progress:', error);
+    }
+  }, [skillProgress]);
+
+  // Fetch training content when skill is selected (MUST be at top level, not in conditional)
+  React.useEffect(() => {
+    if (activeView === 'training' && selectedSkillNode) {
+      const fetchTraining = async () => {
+        setLoadingTraining(true);
+        setTrainingContent(null);
+        try {
+          const res = await fetch('/api/generate-training', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              skillName: selectedSkillNode.name,
+              category: selectedSkillNode.category
+            })
+          });
+          const data = await res.json();
+          setTrainingContent(data);
+        } catch (error) {
+          console.error('Failed to fetch training:', error);
+        } finally {
+          setLoadingTraining(false);
+        }
+      };
+      fetchTraining();
+    }
+  }, [activeView, selectedSkillNode]);
+
+  // Initialize progress tracking when training content loads
+  React.useEffect(() => {
+    if (trainingContent && selectedSkillNode) {
+      const numQuickWins = trainingContent.quickWins?.length || 0;
+      const numChallenges = trainingContent.challenges?.length || 0;
+      initializeSkillProgress(selectedSkillNode.id, numQuickWins, numChallenges);
+    }
+  }, [trainingContent, selectedSkillNode]);
 
     const trainingLibrary = {
     "AI Collaboration & Prompt Engineering": {
@@ -289,8 +351,11 @@ const [completedNodes, setCompletedNodes] = useState([]);
     const currentRole = api.currentRole || api.role || "";
     const automationRisk =
       api.automationRisk !== undefined ? api.automationRisk : null;
+    const futureProofScore =
+      api.futureProofScore !== undefined ? api.futureProofScore : null;
     const skills =
       api.skillsExtracted || api.skills || api.topSkills || [];
+    const skillScores = api.skillScores || [];
 
     const rawPaths =
       api.careerIdeas ||
@@ -310,9 +375,9 @@ const [completedNodes, setCompletedNodes] = useState([]);
         idea.automationRisk !== undefined
           ? idea.automationRisk
           : null,
-      salaryIncrease: idea.salaryChange || "",
+      salaryIncrease: idea.salaryChange || idea.salaryIncrease || "",
       timeToTransition: idea.timeToTransition || "",
-      skillsNeeded: idea.skillsToAdd || [],
+      skillsNeeded: idea.skillsNeeded || idea.skillsToAdd || [],
       skillsFromCurrent: idea.skillsFromCurrent || [],
       demandScore:
         idea.demandScore !== undefined ? idea.demandScore : null,
@@ -323,7 +388,9 @@ const [completedNodes, setCompletedNodes] = useState([]);
       name,
       currentRole,
       automationRisk,
+      futureProofScore,
       skills,
+      skillScores,
       careerPaths,
     };
   };
@@ -346,30 +413,72 @@ const [completedNodes, setCompletedNodes] = useState([]);
     }, 60);
 
     try {
-      const resumeText = await file.text();
+      let resumeText;
+      const isPDF = file.name.toLowerCase().endsWith('.pdf');
 
-      const res = await fetch("/api/analyze-resume", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resumeText }),
-      });
+      if (isPDF) {
+        // For PDFs, convert to base64 and send to backend for parsing
+        const arrayBuffer = await file.arrayBuffer();
+        const base64 = btoa(
+          new Uint8Array(arrayBuffer).reduce(
+            (data, byte) => data + String.fromCharCode(byte),
+            ''
+          )
+        );
 
-      if (!res.ok) {
-        throw new Error(`API error: ${res.status}`);
+        const res = await fetch("/api/analyze-resume", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pdfBase64: base64 }),
+        });
+
+        if (!res.ok) {
+          throw new Error(`API error: ${res.status}`);
+        }
+
+        const apiData = await res.json();
+        console.log("Frontend got from /api/analyze-resume:", apiData);
+
+        const mapped = mapApiResponseToUserData(apiData);
+        setUserData(mapped);
+
+        // Set FPS from AI-calculated score or fallback to automation-based calculation
+        if (mapped.futureProofScore != null) {
+          setFps(mapped.futureProofScore);
+        } else if (mapped.automationRisk != null) {
+          setFps(100 - mapped.automationRisk);
+        }
+
+        setStage("timeline");
+      } else {
+        // For text files, read as text
+        resumeText = await file.text();
+
+        const res = await fetch("/api/analyze-resume", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ resumeText }),
+        });
+
+        if (!res.ok) {
+          throw new Error(`API error: ${res.status}`);
+        }
+
+        const apiData = await res.json();
+        console.log("Frontend got from /api/analyze-resume:", apiData);
+
+        const mapped = mapApiResponseToUserData(apiData);
+        setUserData(mapped);
+
+        // Set FPS from AI-calculated score or fallback to automation-based calculation
+        if (mapped.futureProofScore != null) {
+          setFps(mapped.futureProofScore);
+        } else if (mapped.automationRisk != null) {
+          setFps(100 - mapped.automationRisk);
+        }
+
+        setStage("timeline");
       }
-
-      const apiData = await res.json();
-      console.log("Frontend got from /api/analyze-resume:", apiData);
-
-      const mapped = mapApiResponseToUserData(apiData);
-      setUserData(mapped);
-
-      // simple FPS logic based on automation risk
-      if (mapped.automationRisk != null) {
-        setFps(100 - mapped.automationRisk);
-      }
-
-      setStage("timeline");
     } catch (err) {
       console.error("Failed to analyze resume:", err);
       alert("Failed to analyze resume – check console for details.");
@@ -390,6 +499,68 @@ const [completedNodes, setCompletedNodes] = useState([]);
         setFps((prev) => Math.min(100, prev + node.value));
       }
     }
+  };
+
+  // Helper functions for tracking individual items
+  const initializeSkillProgress = (skillId, numQuickWins, numChallenges) => {
+    if (!skillProgress[skillId]) {
+      setSkillProgress(prev => ({
+        ...prev,
+        [skillId]: {
+          quickWins: Array(numQuickWins).fill(false),
+          challenges: Array(numChallenges).fill(false),
+          project: false
+        }
+      }));
+    }
+  };
+
+  const toggleQuickWin = (skillId, index) => {
+    setSkillProgress(prev => {
+      const current = prev[skillId] || { quickWins: [], challenges: [], project: false };
+      const newQuickWins = [...current.quickWins];
+      newQuickWins[index] = !newQuickWins[index];
+      return {
+        ...prev,
+        [skillId]: { ...current, quickWins: newQuickWins }
+      };
+    });
+  };
+
+  const toggleChallenge = (skillId, index) => {
+    setSkillProgress(prev => {
+      const current = prev[skillId] || { quickWins: [], challenges: [], project: false };
+      const newChallenges = [...current.challenges];
+      newChallenges[index] = !newChallenges[index];
+      return {
+        ...prev,
+        [skillId]: { ...current, challenges: newChallenges }
+      };
+    });
+  };
+
+  const toggleProject = (skillId) => {
+    setSkillProgress(prev => {
+      const current = prev[skillId] || { quickWins: [], challenges: [], project: false };
+      return {
+        ...prev,
+        [skillId]: { ...current, project: !current.project }
+      };
+    });
+  };
+
+  const getSkillCompletionPercentage = (skillId) => {
+    const progress = skillProgress[skillId];
+    if (!progress) return 0;
+
+    const quickWinsCompleted = progress.quickWins.filter(Boolean).length;
+    const challengesCompleted = progress.challenges.filter(Boolean).length;
+    const projectCompleted = progress.project ? 1 : 0;
+
+    const totalItems = progress.quickWins.length + progress.challenges.length + 1; // +1 for project
+    const completedItems = quickWinsCompleted + challengesCompleted + projectCompleted;
+
+    return totalItems > 0 ? Math.round((completedItems / totalItems) * 100) : 0;
   };
 
   // ------------- SIMULATION -------------
@@ -766,7 +937,17 @@ const [completedNodes, setCompletedNodes] = useState([]);
                   <div>
                     <h3>Future-Proof Score</h3>
                     <div className="fps-value">
-                      {fps}/100
+                      {(() => {
+                        // Calculate target FPS for this career path
+                        const targetRisk = selectedCareerPath.automationRisk || 50;
+                        const skillCoverage = selectedCareerPath.skillsFromCurrent?.length || 0;
+                        const totalSkills = (selectedCareerPath.skillsFromCurrent?.length || 0) + (selectedCareerPath.skillsNeeded?.length || 0);
+                        const skillPercentage = totalSkills > 0 ? (skillCoverage / totalSkills) * 100 : 0;
+
+                        // Target FPS = (100 - target automation risk) + skill readiness
+                        const targetFPS = Math.round((100 - targetRisk) + (skillPercentage / 2));
+                        return Math.min(100, Math.max(0, targetFPS));
+                      })()}/100
                     </div>
                   </div>
                 </div>
@@ -774,18 +955,32 @@ const [completedNodes, setCompletedNodes] = useState([]);
                   <div
                     className="fps-fill"
                     style={{
-                      width: `${fps}%`,
-                      background:
-                        fps > 60
-                          ? "#10b981"
-                          : fps > 30
-                          ? "#fbbf24"
-                          : "#ef4444",
+                      width: `${(() => {
+                        const targetRisk = selectedCareerPath.automationRisk || 50;
+                        const skillCoverage = selectedCareerPath.skillsFromCurrent?.length || 0;
+                        const totalSkills = (selectedCareerPath.skillsFromCurrent?.length || 0) + (selectedCareerPath.skillsNeeded?.length || 0);
+                        const skillPercentage = totalSkills > 0 ? (skillCoverage / totalSkills) * 100 : 0;
+                        const targetFPS = Math.round((100 - targetRisk) + (skillPercentage / 2));
+                        return Math.min(100, Math.max(0, targetFPS));
+                      })()}%`,
+                      background: (() => {
+                        const targetRisk = selectedCareerPath.automationRisk || 50;
+                        const skillCoverage = selectedCareerPath.skillsFromCurrent?.length || 0;
+                        const totalSkills = (selectedCareerPath.skillsFromCurrent?.length || 0) + (selectedCareerPath.skillsNeeded?.length || 0);
+                        const skillPercentage = totalSkills > 0 ? (skillCoverage / totalSkills) * 100 : 0;
+                        const targetFPS = Math.round((100 - targetRisk) + (skillPercentage / 2));
+                        const score = Math.min(100, Math.max(0, targetFPS));
+                        return score > 60 ? "#10b981" : score > 30 ? "#fbbf24" : "#ef4444";
+                      })(),
                     }}
                   />
                 </div>
                 <div className="fps-breakdown">
-                  <div>
+                  <div
+                    className="metric-box"
+                    onClick={() => setShowMetricExplanation('currentRisk')}
+                    title="Click for explanation"
+                  >
                     <span>Current Risk:</span>
                     <span>
                       {userData.automationRisk != null
@@ -793,27 +988,222 @@ const [completedNodes, setCompletedNodes] = useState([]);
                         : "-"}
                     </span>
                   </div>
-                  <div>
+                  <div
+                    className="metric-box"
+                    onClick={() => setShowMetricExplanation('targetRisk')}
+                    title="Click for explanation"
+                  >
                     <span>Target Risk:</span>
                     <span>
-                      {selectedCareerPath.automationRisk !=
-                      null
+                      {selectedCareerPath.automationRisk != null
                         ? `${selectedCareerPath.automationRisk}%`
                         : "-"}
                     </span>
                   </div>
-                  <div>
-                    <span>Skills Progress:</span>
-                    <span>
-                      {completedNodes.length}/
-                      {skillNodes.length}
+                  <div
+                    className="metric-box"
+                    onClick={() => setShowMetricExplanation('riskChange')}
+                    title="Click for explanation"
+                  >
+                    <span>Risk Change:</span>
+                    <span style={{
+                      color: (selectedCareerPath.automationRisk || 0) < (userData.automationRisk || 0)
+                        ? "#10b981"
+                        : (selectedCareerPath.automationRisk || 0) > (userData.automationRisk || 0)
+                        ? "#ef4444"
+                        : "#fbbf24"
+                    }}>
+                      {userData.automationRisk != null && selectedCareerPath.automationRisk != null
+                        ? `${selectedCareerPath.automationRisk - userData.automationRisk > 0 ? '+' : ''}${selectedCareerPath.automationRisk - userData.automationRisk}%`
+                        : "-"}
                     </span>
                   </div>
                   <div>
+                    <span>Skills Have:</span>
+                    <span>
+                      {selectedCareerPath.skillsFromCurrent?.length || 0}
+                    </span>
+                  </div>
+                  <div>
+                    <span>Skills to Learn:</span>
+                    <span>
+                      {selectedCareerPath.skillsNeeded?.length || 0}
+                    </span>
+                  </div>
+                  <div>
+                    <span>Readiness:</span>
+                    <span>
+                      {(() => {
+                        const have = selectedCareerPath.skillsFromCurrent?.length || 0;
+                        const need = selectedCareerPath.skillsNeeded?.length || 0;
+                        const total = have + need;
+                        return total > 0 ? `${Math.round((have / total) * 100)}%` : "-";
+                      })()}
+                    </span>
+                  </div>
+                  <div
+                    className="metric-box"
+                    onClick={() => setShowMetricExplanation('demand')}
+                    title="Click for explanation"
+                  >
                     <span>Market Demand:</span>
-                    <span>High</span>
+                    <span>
+                      {selectedCareerPath.demandScore != null
+                        ? `${selectedCareerPath.demandScore}/100`
+                        : "High"}
+                    </span>
+                  </div>
+                  <div
+                    className="metric-box"
+                    onClick={() => setShowMetricExplanation('time')}
+                    title="Click for explanation"
+                  >
+                    <span>Time Needed:</span>
+                    <span>{selectedCareerPath.timeToTransition || "-"}</span>
                   </div>
                 </div>
+
+                {/* Metric Explanation Modal */}
+                {showMetricExplanation && (
+                  <div className="explanation-modal" onClick={() => setShowMetricExplanation(null)}>
+                    <div className="explanation-content" onClick={(e) => e.stopPropagation()}>
+                      <button className="close-btn" onClick={() => setShowMetricExplanation(null)}>✕</button>
+
+                      {showMetricExplanation === 'currentRisk' && (
+                        <>
+                          <h3>Current Automation Risk: {userData.automationRisk}%</h3>
+                          <p><strong>What this means:</strong></p>
+                          <p>This percentage represents how likely your current role is to be automated or significantly changed by AI/automation in the next 5-10 years.</p>
+                          <p><strong>How it's calculated:</strong></p>
+                          <ul>
+                            <li>AI analyzes your job description and tasks</li>
+                            <li>Evaluates how repetitive vs. creative the work is</li>
+                            <li>Considers how rule-based vs. strategic the role is</li>
+                            <li>Lower scores (0-30%) = More future-proof (creative, strategic, people-focused)</li>
+                            <li>Higher scores (60-100%) = Higher risk (repetitive, rule-based, data-heavy)</li>
+                          </ul>
+                        </>
+                      )}
+
+                      {showMetricExplanation === 'targetRisk' && (
+                        <>
+                          <h3>Target Role Automation Risk: {selectedCareerPath.automationRisk}%</h3>
+                          <p><strong>What this means:</strong></p>
+                          <p>This is the automation risk for <strong>{selectedCareerPath.title}</strong>.</p>
+                          <p><strong>Why this role:</strong></p>
+                          <p>{selectedCareerPath.description}</p>
+                          <p><strong>Risk factors considered:</strong></p>
+                          <ul>
+                            <li>Job market trends and AI advancement in this field</li>
+                            <li>How much human judgment and creativity is required</li>
+                            <li>Level of interpersonal interaction needed</li>
+                            <li>Regulatory and ethical considerations that require humans</li>
+                          </ul>
+                          <p><strong>Goal:</strong> We recommend paths with LOWER risk than your current {userData.automationRisk}%.</p>
+                        </>
+                      )}
+
+                      {showMetricExplanation === 'riskChange' && (
+                        <>
+                          <h3>Risk Change: {selectedCareerPath.automationRisk - userData.automationRisk > 0 ? '+' : ''}{selectedCareerPath.automationRisk - userData.automationRisk}%</h3>
+                          <p><strong>What this means:</strong></p>
+                          {(selectedCareerPath.automationRisk - userData.automationRisk) < 0 ? (
+                            <p style={{color: '#10b981'}}>✅ <strong>Good news!</strong> This career path has LOWER automation risk than your current role. You're moving to a more future-proof position.</p>
+                          ) : (selectedCareerPath.automationRisk - userData.automationRisk) > 0 ? (
+                            <p style={{color: '#ef4444'}}>⚠️ This path has HIGHER automation risk. Consider if the salary increase or other benefits justify this trade-off.</p>
+                          ) : (
+                            <p style={{color: '#fbbf24'}}>→ Similar risk level. You're moving laterally in terms of automation safety.</p>
+                          )}
+                          <p><strong>How to interpret:</strong></p>
+                          <ul>
+                            <li>Negative numbers (green) = Safer career move</li>
+                            <li>Positive numbers (red) = Higher risk career move</li>
+                            <li>Zero (yellow) = Similar risk level</li>
+                          </ul>
+                        </>
+                      )}
+
+                      {showMetricExplanation === 'demand' && (
+                        <>
+                          <h3>Market Demand: {selectedCareerPath.demandScore}/100</h3>
+                          <p><strong>What this means:</strong></p>
+                          <p>This score represents current and projected market demand for <strong>{selectedCareerPath.title}</strong> professionals.</p>
+                          <p><strong>How it's calculated:</strong></p>
+                          <ul>
+                            <li>Current job posting trends and growth rates</li>
+                            <li>Industry reports on workforce needs</li>
+                            <li>Projected growth in related sectors</li>
+                            <li>Skills gap analysis (supply vs. demand)</li>
+                            <li>Geographic availability of opportunities</li>
+                          </ul>
+                          <p><strong>Scoring:</strong></p>
+                          <ul>
+                            <li>80-100: Very high demand, excellent prospects</li>
+                            <li>60-79: Good demand, solid opportunities</li>
+                            <li>40-59: Moderate demand, competitive market</li>
+                            <li>0-39: Low demand, challenging market</li>
+                          </ul>
+                          <p><strong>Explore Current Job Openings:</strong></p>
+                          <div className="job-links">
+                            <a
+                              href={`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(selectedCareerPath.title)}&location=Worldwide&f_TPR=r604800`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="job-link linkedin"
+                            >
+                              🔗 LinkedIn Jobs (Past Week)
+                            </a>
+                            <a
+                              href={`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(selectedCareerPath.title)}&location=United%20States&f_E=2`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="job-link linkedin"
+                            >
+                              🔗 Entry-Level Positions (US)
+                            </a>
+                            <a
+                              href={`https://www.indeed.com/jobs?q=${encodeURIComponent(selectedCareerPath.title)}&l=&fromage=7`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="job-link indeed"
+                            >
+                              🔗 Indeed Jobs (Past Week)
+                            </a>
+                            <a
+                              href={`https://www.glassdoor.com/Job/jobs.htm?sc.keyword=${encodeURIComponent(selectedCareerPath.title)}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="job-link glassdoor"
+                            >
+                              🔗 Glassdoor (with Salary Info)
+                            </a>
+                          </div>
+                          <p style={{fontSize: '0.85rem', color: 'rgba(255,255,255,0.6)', marginTop: '1rem'}}>
+                            💡 Tip: Bookmark these searches and check them weekly to see market trends and requirements.
+                          </p>
+                        </>
+                      )}
+
+                      {showMetricExplanation === 'time' && (
+                        <>
+                          <h3>Time to Transition: {selectedCareerPath.timeToTransition}</h3>
+                          <p><strong>What this means:</strong></p>
+                          <p>This is a realistic estimate of how long it will take you to become job-ready for <strong>{selectedCareerPath.title}</strong>.</p>
+                          <p><strong>What's included in this estimate:</strong></p>
+                          <ul>
+                            <li>Time to learn the {selectedCareerPath.skillsNeeded?.length || 0} new skills required</li>
+                            <li>Building a portfolio or relevant experience</li>
+                            <li>Networking and making industry connections</li>
+                            <li>Job search and interview preparation</li>
+                          </ul>
+                          <p><strong>Your starting point:</strong></p>
+                          <p>You already have {selectedCareerPath.skillsFromCurrent?.length || 0} transferable skills, which accelerates your transition.</p>
+                          <p><strong>Note:</strong> This assumes consistent part-time learning (10-15 hours/week). Full-time dedication could cut this timeline in half.</p>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="nav-cards">
@@ -845,141 +1235,411 @@ const [completedNodes, setCompletedNodes] = useState([]);
             const pathSkillsHave = path.skillsFromCurrent || [];
             const pathSkillsNeed = path.skillsNeeded || [];
 
-            // Only keep nodes that matter for THIS path
-            const baseNodes = skillNodes.filter((node) =>
-              pathSkillsHave.includes(node.name) || pathSkillsNeed.includes(node.name)
-            );
-
-            // Work out status per node (Completed / Current / Locked)
-            const nodesWithStatus = baseNodes.map((node) => {
-              const alreadyHave =
-                completedNodes.includes(node.id) ||
-                pathSkillsHave.includes(node.name) ||
-                userSkills.includes(node.name) ||
-                hasSkillForNode(node.id); // extra AI-based check
-
-              let status = "locked";
-              if (alreadyHave) {
-                status = "completed";
-              } else if (pathSkillsNeed.includes(node.name)) {
-                status = "current";
+            // Categorize skills by type for logical grouping
+            const categorizeSkill = (skillName) => {
+              const skill = skillName.toLowerCase();
+              // Technical skills
+              if (skill.match(/(programming|python|javascript|react|code|development|sql|database|api|git|docker|aws|cloud|framework|library|typescript|java|c\+\+|html|css)/)) {
+                return 'technical';
               }
+              // Soft/Leadership skills
+              if (skill.match(/(leadership|communication|management|collaboration|teamwork|presentation|negotiation|emotional|empathy|stakeholder|strategy|planning)/)) {
+                return 'soft';
+              }
+              // Domain/Industry skills
+              if (skill.match(/(healthcare|medical|finance|marketing|sales|design|ux|ui|analytics|data|research|compliance|regulatory)/)) {
+                return 'domain';
+              }
+              // Learning/Process skills
+              return 'learning';
+            };
 
-              return { ...node, status };
+            // Group skills by category
+            const skillsByCategory = {
+              technical: [],
+              soft: [],
+              domain: [],
+              learning: []
+            };
+
+            pathSkillsHave.forEach(skill => {
+              const category = categorizeSkill(skill);
+              skillsByCategory[category].push({ name: skill, status: 'completed' });
             });
 
-            // Create a goal node for this specific career path
+            pathSkillsNeed.forEach(skill => {
+              const category = categorizeSkill(skill);
+              skillsByCategory[category].push({ name: skill, status: 'current' });
+            });
+
+            // Create nodes with strategic positioning in columns by category
+            const categoryPositions = {
+              technical: { x: 80, label: 'Technical Skills', color: '#818cf8' },
+              soft: { x: 320, label: 'Soft Skills', color: '#c084fc' },
+              domain: { x: 560, label: 'Domain Knowledge', color: '#10b981' },
+              learning: { x: 800, label: 'Growth Skills', color: '#fbbf24' }
+            };
+
+            let allNodes = [];
+            let nodeId = 0;
+
+            Object.keys(skillsByCategory).forEach(category => {
+              const skills = skillsByCategory[category];
+              if (skills.length === 0) return;
+
+              const baseX = categoryPositions[category].x;
+              const startY = 120;
+              const spacing = 75;
+
+              skills.forEach((skill, idx) => {
+                allNodes.push({
+                  id: `skill-${nodeId++}`,
+                  name: skill.name,
+                  x: baseX,
+                  y: startY + (idx * spacing),
+                  status: skill.status,
+                  category: category,
+                  categoryColor: categoryPositions[category].color
+                });
+              });
+            });
+
+            // Create goal node at the center bottom
             const goalNode = {
               id: "goal-node",
               name: path.title,
-              x: 780,
-              y: 250,
+              x: 450,
+              y: 600,
               status: "goal",
             };
 
-            const allNodes = [...nodesWithStatus, goalNode];
-            const visibleIds = new Set(allNodes.map((n) => n.id));
+            allNodes.push(goalNode);
 
-            // Edges between visible nodes + each skill → goal
-            const visibleDeps = [
-              ...dependencies,
-              ...nodesWithStatus.map((n) => ({ from: n.id, to: goalNode.id })),
-            ].filter(
-              (dep) => visibleIds.has(dep.from) && visibleIds.has(dep.to)
-            );
+            // Create logical connections
+            const createLogicalConnections = () => {
+              const connections = [];
+
+              // Connect completed skills to skills that need them as prerequisites
+              const completedNodes = allNodes.filter(n => n.status === 'completed' && n.id !== 'goal-node');
+              const needNodes = allNodes.filter(n => n.status === 'current' && n.id !== 'goal-node');
+
+              // Connect within same category (vertical flow)
+              Object.keys(skillsByCategory).forEach(category => {
+                const categoryNodes = allNodes.filter(n => n.category === category);
+                for (let i = 0; i < categoryNodes.length - 1; i++) {
+                  if (categoryNodes[i].status === 'completed' && categoryNodes[i + 1].status === 'current') {
+                    connections.push({ from: categoryNodes[i].id, to: categoryNodes[i + 1].id, type: 'prerequisite' });
+                  }
+                }
+              });
+
+              // Connect across categories for logical dependencies
+              completedNodes.forEach(completed => {
+                needNodes.forEach(needed => {
+                  // Technical skills often prerequisite for domain skills
+                  if (completed.category === 'technical' && needed.category === 'domain') {
+                    connections.push({ from: completed.id, to: needed.id, type: 'supports' });
+                  }
+                  // Soft skills support all other skills
+                  if (completed.category === 'soft' && Math.random() > 0.6) {
+                    connections.push({ from: completed.id, to: needed.id, type: 'enables' });
+                  }
+                });
+              });
+
+              // All skills eventually lead to goal
+              allNodes.forEach(node => {
+                if (node.id !== 'goal-node') {
+                  connections.push({ from: node.id, to: goalNode.id, type: 'contributes' });
+                }
+              });
+
+              return connections;
+            };
+
+            const connections = createLogicalConnections();
 
             const getColor = (status) => {
               if (status === "completed") return "#10b981";
               if (status === "current")   return "#818cf8";
               if (status === "goal")      return "#fbbf24";
-              return "#6b7280"; // locked
+              return "#6b7280";
             };
+
+            const getConnectionStyle = (type) => {
+              switch(type) {
+                case 'prerequisite':
+                  return { stroke: "rgba(129,140,248,0.6)", strokeWidth: "3", strokeDasharray: "none" };
+                case 'supports':
+                  return { stroke: "rgba(16,185,129,0.4)", strokeWidth: "2", strokeDasharray: "5,5" };
+                case 'enables':
+                  return { stroke: "rgba(192,132,252,0.4)", strokeWidth: "2", strokeDasharray: "3,3" };
+                case 'contributes':
+                  return { stroke: "rgba(251,191,36,0.2)", strokeWidth: "1.5", strokeDasharray: "none" };
+                default:
+                  return { stroke: "rgba(129,140,248,0.3)", strokeWidth: "2", strokeDasharray: "none" };
+              }
+            };
+
+            // Filter nodes based on selected category
+            const filteredNodes = skillCategoryFilter === 'all'
+              ? allNodes
+              : allNodes.filter(node => node.id === 'goal-node' || node.category === skillCategoryFilter);
+
+            // Filter connections to only show connections between visible nodes
+            const visibleNodeIds = new Set(filteredNodes.map(n => n.id));
+            const filteredConnections = connections.filter(
+              conn => visibleNodeIds.has(conn.from) && visibleNodeIds.has(conn.to)
+            );
 
             return (
               <div className="skill-map">
                 <div className="map-header">
-                  <h2>Dynamic Skill Dependency Map</h2>
-                  <button onClick={() => setActiveView("dashboard")}>
-                    ← Back
+                  <div>
+                    <h2>Skill Journey Map</h2>
+                    <p style={{fontSize: '0.9rem', color: 'rgba(255,255,255,0.6)', marginTop: '0.5rem'}}>
+                      Your path to {path.title}
+                    </p>
+                  </div>
+                  <button className="back-btn" onClick={() => setActiveView("dashboard")}>
+                    ← Back to Dashboard
                   </button>
                 </div>
 
-                <svg viewBox="0 0 900 400" className="map-svg">
-                  {/* Edges */}
-                  {visibleDeps.map((dep, i) => {
-                    const from = allNodes.find((n) => n.id === dep.from);
-                    const to   = allNodes.find((n) => n.id === dep.to);
+                <div className="filter-controls">
+                  <div className="filter-label">Filter by Category:</div>
+                  <div className="filter-buttons">
+                    <button
+                      className={`filter-btn ${skillCategoryFilter === 'all' ? 'active' : ''}`}
+                      onClick={() => setSkillCategoryFilter('all')}
+                    >
+                      All Skills
+                    </button>
+                    {Object.entries(categoryPositions).map(([key, val]) => (
+                      skillsByCategory[key].length > 0 && (
+                        <button
+                          key={key}
+                          className={`filter-btn ${skillCategoryFilter === key ? 'active' : ''}`}
+                          onClick={() => setSkillCategoryFilter(key)}
+                          style={{
+                            borderColor: skillCategoryFilter === key ? val.color : 'rgba(255,255,255,0.2)',
+                            color: skillCategoryFilter === key ? val.color : 'rgba(255,255,255,0.7)'
+                          }}
+                        >
+                          {val.label}
+                        </button>
+                      )
+                    ))}
+                  </div>
+                </div>
+
+                <div className="category-labels">
+                  {Object.entries(categoryPositions).map(([key, val]) => (
+                    skillsByCategory[key].length > 0 && (skillCategoryFilter === 'all' || skillCategoryFilter === key) && (
+                      <div
+                        key={key}
+                        className="category-label"
+                        style={{
+                          left: `${val.x - 20}px`,
+                          color: val.color,
+                          borderColor: val.color
+                        }}
+                      >
+                        {val.label}
+                      </div>
+                    )
+                  ))}
+                </div>
+
+                <svg viewBox="0 0 1050 700" className="map-svg">
+                  <defs>
+                    <filter id="glow">
+                      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+                      <feMerge>
+                        <feMergeNode in="coloredBlur"/>
+                        <feMergeNode in="SourceGraphic"/>
+                      </feMerge>
+                    </filter>
+                    <linearGradient id="goalGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" style={{stopColor: '#fbbf24', stopOpacity: 1}} />
+                      <stop offset="100%" style={{stopColor: '#f59e0b', stopOpacity: 1}} />
+                    </linearGradient>
+                  </defs>
+
+                  {/* Draw connections */}
+                  {filteredConnections.map((conn, i) => {
+                    const from = filteredNodes.find((n) => n.id === conn.from);
+                    const to = filteredNodes.find((n) => n.id === conn.to);
                     if (!from || !to) return null;
+
+                    const style = getConnectionStyle(conn.type);
+
+                    // Calculate control points for curved paths
+                    const midX = (from.x + to.x) / 2;
+                    const midY = (from.y + to.y) / 2;
+
                     return (
-                      <line
-                        key={i}
-                        x1={from.x + 220}
-                        y1={from.y + 20}
-                        x2={to.x}
-                        y2={to.y + 20}
-                        stroke="rgba(129,140,248,0.3)"
-                        strokeWidth="2"
+                      <path
+                        key={`conn-${i}`}
+                        d={`M ${from.x + 100} ${from.y + 20} Q ${midX} ${midY} ${to.x + (to.id === 'goal-node' ? 130 : 100)} ${to.y + 20}`}
+                        fill="none"
+                        stroke={style.stroke}
+                        strokeWidth={style.strokeWidth}
+                        strokeDasharray={style.strokeDasharray}
+                        opacity="0.6"
                       />
                     );
                   })}
 
-                  {/* Nodes */}
-                  {allNodes.map((node) => (
-                    <g
-                      key={node.id}
-                      onClick={() => {
-                        // only skills (not goal) & not completed open training
-                        if (node.id !== "goal-node" && node.status !== "completed") {
-                          setSelectedSkillNode(node);
-                          setActiveView("training");
-                        }
-                      }}
-                      style={{
-                        cursor:
-                          node.id !== "goal-node" && node.status !== "completed"
-                            ? "pointer"
-                            : "default",
-                      }}
-                    >
-                      <rect
-                        x={node.x}
-                        y={node.y}
-                        width={node.id === "goal-node" ? 180 : 260}
-                        height="40"
-                        rx="8"
-                        fill={getColor(node.status)}
-                        opacity="0.9"
-                      />
-                      <text
-                        x={node.x + (node.id === "goal-node" ? 90 : 130)}
-                        y={node.y + 25}
-                        textAnchor="middle"
-                        fill="#fff"
-                        fontSize="11"
-                        fontWeight="600"
+                  {/* Draw nodes */}
+                  {filteredNodes.map((node) => {
+                    const isGoal = node.id === "goal-node";
+                    const width = isGoal ? 260 : 200;
+                    const height = isGoal ? 60 : 45;
+                    const nodeColor = isGoal ? "url(#goalGradient)" : getColor(node.status);
+                    const completionPct = !isGoal ? getSkillCompletionPercentage(node.id) : 0;
+                    const hasProgress = completionPct > 0 && completionPct < 100;
+
+                    return (
+                      <g
+                        key={node.id}
+                        onClick={() => {
+                          if (!isGoal && node.status !== "completed") {
+                            setSelectedSkillNode(node);
+                            setActiveView("training");
+                          }
+                        }}
+                        style={{
+                          cursor: !isGoal && node.status !== "completed" ? "pointer" : "default",
+                        }}
+                        className={`skill-node ${node.status}`}
                       >
-                        {node.name}
-                      </text>
-                    </g>
-                  ))}
+                        <rect
+                          x={node.x}
+                          y={node.y}
+                          width={width}
+                          height={height}
+                          rx="12"
+                          fill={nodeColor}
+                          opacity="0.95"
+                          filter={isGoal ? "url(#glow)" : "none"}
+                          stroke={node.categoryColor || (isGoal ? "#fbbf24" : "rgba(255,255,255,0.2)")}
+                          strokeWidth={isGoal ? "3" : "2"}
+                        />
+
+                        {/* Status icon with progress */}
+                        {!isGoal && (
+                          <>
+                            {hasProgress && (
+                              <>
+                                {/* Progress ring background */}
+                                <circle
+                                  cx={node.x + 15}
+                                  cy={node.y + 22.5}
+                                  r="10"
+                                  fill="none"
+                                  stroke="rgba(255,255,255,0.2)"
+                                  strokeWidth="2"
+                                />
+                                {/* Progress ring fill */}
+                                <circle
+                                  cx={node.x + 15}
+                                  cy={node.y + 22.5}
+                                  r="10"
+                                  fill="none"
+                                  stroke="#10b981"
+                                  strokeWidth="2"
+                                  strokeDasharray={`${(completionPct / 100) * 62.83} 62.83`}
+                                  strokeDashoffset="15.7075"
+                                  transform={`rotate(-90 ${node.x + 15} ${node.y + 22.5})`}
+                                />
+                                {/* Percentage text */}
+                                <text
+                                  x={node.x + 15}
+                                  y={node.y + 26}
+                                  fill="#fff"
+                                  fontSize="8"
+                                  fontWeight="700"
+                                  textAnchor="middle"
+                                >
+                                  {completionPct}
+                                </text>
+                              </>
+                            )}
+                            {!hasProgress && (
+                              <text
+                                x={node.x + 15}
+                                y={node.y + 28}
+                                fill="#fff"
+                                fontSize="16"
+                              >
+                                {node.status === 'completed' || completionPct === 100 ? '✓' : '○'}
+                              </text>
+                            )}
+                          </>
+                        )}
+
+                        {/* Skill name */}
+                        <text
+                          x={node.x + (isGoal ? 130 : 35)}
+                          y={node.y + (isGoal ? 35 : 28)}
+                          textAnchor={isGoal ? "middle" : "start"}
+                          fill="#fff"
+                          fontSize={isGoal ? "14" : "12"}
+                          fontWeight={isGoal ? "700" : "600"}
+                        >
+                          {node.name.length > (isGoal ? 35 : 25)
+                            ? node.name.substring(0, isGoal ? 35 : 25) + '...'
+                            : node.name}
+                        </text>
+
+                        {/* Hover effect */}
+                        {!isGoal && node.status !== "completed" && (
+                          <rect
+                            x={node.x}
+                            y={node.y}
+                            width={width}
+                            height={height}
+                            rx="12"
+                            fill="rgba(255,255,255,0.1)"
+                            opacity="0"
+                            className="hover-overlay"
+                          />
+                        )}
+                      </g>
+                    );
+                  })}
                 </svg>
 
                 <div className="map-legend">
-                  <div>
-                    <div style={{ background: "#10b981" }} />
-                    Completed
+                  <div className="legend-item">
+                    <div className="legend-dot" style={{ background: "#10b981" }} />
+                    <span>You Have This</span>
                   </div>
-                  <div>
-                    <div style={{ background: "#818cf8" }} />
-                    Current
+                  <div className="legend-item">
+                    <div className="legend-dot" style={{ background: "#818cf8" }} />
+                    <span>Need to Learn</span>
                   </div>
-                  <div>
-                    <div style={{ background: "#6b7280" }} />
-                    Locked
+                  <div className="legend-item">
+                    <div className="legend-dot" style={{ background: "#fbbf24" }} />
+                    <span>Career Goal</span>
                   </div>
-                  <div>
-                    <div style={{ background: "#fbbf24" }} />
-                    Goal
+                </div>
+
+                <div className="map-stats">
+                  <div className="stat-card">
+                    <div className="stat-value">{pathSkillsHave.length}</div>
+                    <div className="stat-label">Skills You Have</div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="stat-value">{pathSkillsNeed.length}</div>
+                    <div className="stat-label">Skills to Acquire</div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="stat-value">
+                      {Math.round((pathSkillsHave.length / (pathSkillsHave.length + pathSkillsNeed.length)) * 100)}%
+                    </div>
+                    <div className="stat-label">Journey Progress</div>
                   </div>
                 </div>
               </div>
@@ -1068,81 +1728,217 @@ const [completedNodes, setCompletedNodes] = useState([]);
               )}
             </div>
           )}
-                    {activeView === "training" && selectedSkillNode && (
-            <div className="training">
-              <div className="training-header">
-                <h2>{selectedSkillNode.name} – Skill Studio</h2>
-                <button onClick={() => setActiveView("skillMap")}>
-                  ← Back to Map
-                </button>
-              </div>
+                    {activeView === "training" && selectedSkillNode && (() => {
+            return (
+              <div className="training">
+                <div className="training-header">
+                  <div>
+                    <h2>{selectedSkillNode.name}</h2>
+                    <p style={{fontSize: '0.9rem', color: 'rgba(255,255,255,0.6)', marginTop: '0.5rem'}}>
+                      Action-Based Learning Studio
+                    </p>
+                  </div>
+                  <button className="back-btn" onClick={() => {
+                    setActiveView("skillMap");
+                    setTrainingContent(null);
+                  }}>
+                    ← Back to Map
+                  </button>
+                </div>
 
-              {(() => {
-                const t = trainingLibrary[selectedSkillNode.name] || {
-                  tagline: "Practice this skill with a focused mini-sprint.",
-                  outcomes: [],
-                  microLesson: [],
-                  practice: [],
-                  reflection: [],
-                };
+                {loadingTraining ? (
+                  <div className="loading-state">
+                    <div className="spinner"></div>
+                    <p>Generating your personalized learning plan...</p>
+                  </div>
+                ) : trainingContent ? (
+                  <>
+                    <div className="training-hero">
+                      <h3>{trainingContent.tagline}</h3>
+                      <div className="progress-stats">
+                        <div className="progress-bar-container">
+                          <div
+                            className="progress-bar-fill"
+                            style={{width: `${getSkillCompletionPercentage(selectedSkillNode.id)}%`}}
+                          ></div>
+                        </div>
+                        <p className="progress-text">
+                          {getSkillCompletionPercentage(selectedSkillNode.id)}% Complete
+                        </p>
+                      </div>
+                    </div>
 
-                return (
-                  <div className="training-grid">
-                    <section className="training-card">
-                      <h3>Why this skill matters</h3>
-                      <p className="tagline">{t.tagline}</p>
-                      {t.outcomes.length > 0 && (
-                        <ul>
-                          {t.outcomes.map((item, i) => (
-                            <li key={i}>{item}</li>
-                          ))}
-                        </ul>
-                      )}
-                    </section>
+                    <div className="quick-wins-section">
+                      <h3>🚀 Start Right Now (30 min)</h3>
+                      <p style={{color: 'rgba(255,255,255,0.7)', marginBottom: '1rem'}}>
+                        No setup required. Just pick one and DO it:
+                      </p>
+                      <div className="quick-wins-grid">
+                        {trainingContent.quickWins?.map((win, i) => {
+                          const isChecked = skillProgress[selectedSkillNode.id]?.quickWins[i] || false;
+                          return (
+                            <div
+                              key={i}
+                              className={`quick-win-card ${isChecked ? 'completed' : ''}`}
+                              onClick={() => toggleQuickWin(selectedSkillNode.id, i)}
+                              style={{cursor: 'pointer'}}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={() => toggleQuickWin(selectedSkillNode.id, i)}
+                                onClick={(e) => e.stopPropagation()}
+                                className="win-checkbox"
+                              />
+                              <div className="win-content">
+                                <span className="win-number">{i + 1}</span>
+                                <p>{win}</p>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
 
-                    <section className="training-card">
-                      <h3>10–15 min Micro-Lesson</h3>
-                      <ol>
-                        {t.microLesson.map((step, i) => (
-                          <li key={i}>{step}</li>
-                        ))}
-                      </ol>
-                    </section>
+                    <div className="build-project-section">
+                      <h3>🛠️ Build Something Real</h3>
+                      <div className={`project-card ${skillProgress[selectedSkillNode.id]?.project ? 'completed' : ''}`}>
+                        <div className="project-header">
+                          <h4>{trainingContent.buildProject?.title}</h4>
+                          <button
+                            className={`project-complete-btn ${skillProgress[selectedSkillNode.id]?.project ? 'checked' : ''}`}
+                            onClick={() => toggleProject(selectedSkillNode.id)}
+                          >
+                            {skillProgress[selectedSkillNode.id]?.project ? '✓ Completed' : 'Mark Complete'}
+                          </button>
+                        </div>
+                        <p className="project-description">{trainingContent.buildProject?.description}</p>
+                        <div className="project-meta">
+                          <span>⏱️ {trainingContent.buildProject?.timeEstimate}</span>
+                        </div>
+                        <div className="project-steps">
+                          <strong>Steps:</strong>
+                          <ol>
+                            {trainingContent.buildProject?.steps?.map((step, i) => (
+                              <li key={i}>{step}</li>
+                            ))}
+                          </ol>
+                        </div>
+                      </div>
+                    </div>
 
-                    <section className="training-card">
-                      <h3>Try it now</h3>
-                      <ul>
-                        {t.practice.map((task, i) => (
-                          <li key={i}>{task}</li>
-                        ))}
-                      </ul>
-                    </section>
+                    <div className="resources-section">
+                      <h3>📚 Learn From the Best</h3>
+                      <div className="resources-grid">
+                        <a
+                          href={trainingContent.resourceUrls?.youtube}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="resource-card youtube"
+                        >
+                          <div className="resource-icon">▶️</div>
+                          <div className="resource-content">
+                            <h4>{trainingContent.resources?.video?.title}</h4>
+                            <p className="resource-creator">{trainingContent.resources?.video?.creator}</p>
+                            <span className="resource-meta">{trainingContent.resources?.video?.duration}</span>
+                          </div>
+                        </a>
 
-                    <section className="training-card">
-                      <h3>Reflect & Embed</h3>
-                      <ul>
-                        {t.reflection.map((q, i) => (
+                        <a
+                          href={trainingContent.resourceUrls?.course}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="resource-card course"
+                        >
+                          <div className="resource-icon">🎓</div>
+                          <div className="resource-content">
+                            <h4>{trainingContent.resources?.course?.title}</h4>
+                            <p className="resource-creator">{trainingContent.resources?.course?.platform} • {trainingContent.resources?.course?.instructor}</p>
+                          </div>
+                        </a>
+
+                        <a
+                          href={trainingContent.resourceUrls?.practice}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="resource-card practice"
+                        >
+                          <div className="resource-icon">💪</div>
+                          <div className="resource-content">
+                            <h4>{trainingContent.resources?.practice?.title}</h4>
+                            <p className="resource-creator">{trainingContent.resources?.practice?.platform}</p>
+                            <span className="resource-meta">{trainingContent.resources?.practice?.description}</span>
+                          </div>
+                        </a>
+                      </div>
+                    </div>
+
+                    <div className="challenges-section">
+                      <h3>🎯 Test Your Skills</h3>
+                      <p style={{color: 'rgba(255,255,255,0.7)', marginBottom: '1rem'}}>
+                        Complete these challenges to prove mastery:
+                      </p>
+                      <div className="challenges-list">
+                        {trainingContent.challenges?.map((challenge, i) => {
+                          const isChecked = skillProgress[selectedSkillNode.id]?.challenges[i] || false;
+                          return (
+                            <div
+                              key={i}
+                              className={`challenge-item ${isChecked ? 'completed' : ''}`}
+                              onClick={() => toggleChallenge(selectedSkillNode.id, i)}
+                              style={{cursor: 'pointer'}}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={() => toggleChallenge(selectedSkillNode.id, i)}
+                                onClick={(e) => e.stopPropagation()}
+                                className="challenge-checkbox"
+                              />
+                              <div className="challenge-content">
+                                <div className="challenge-level">Level {i + 1}</div>
+                                <p>{challenge}</p>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    <div className="reflection-section">
+                      <h3>🧠 Deepen Your Understanding</h3>
+                      <p style={{color: 'rgba(255,255,255,0.7)', marginBottom: '1rem'}}>
+                        After completing the project, reflect on these:
+                      </p>
+                      <ul className="reflection-list">
+                        {trainingContent.reflection?.map((q, i) => (
                           <li key={i}>{q}</li>
                         ))}
                       </ul>
+                    </div>
 
-                      {/* Optional: mark complete */}
+                    <div className="completion-section">
                       <button
-                        className="complete-btn"
+                        className="complete-btn-large"
                         onClick={() => {
                           if (!completedNodes.includes(selectedSkillNode.id)) {
                             completeNode(selectedSkillNode.id);
+                            setActiveView("skillMap");
                           }
                         }}
                       >
-                        Mark this skill as completed
+                        {completedNodes.includes(selectedSkillNode.id) ? '✓ Completed' : 'Mark as Complete & Return to Map'}
                       </button>
-                    </section>
+                    </div>
+                  </>
+                ) : (
+                  <div className="error-state">
+                    <p>Failed to load training content. Please try again.</p>
                   </div>
-                );
-              })()}
-            </div>
-          )}
+                )}
+              </div>
+            );
+          })()}
 
         </>
       )}
@@ -1206,22 +2002,60 @@ const [completedNodes, setCompletedNodes] = useState([]);
         .fps-value { font-size:3rem; font-weight:800; font-family:'Space Mono',monospace; color:#818cf8; }
         .fps-bar { height:20px; background:rgba(255,255,255,0.1); border-radius:10px; overflow:hidden; margin-bottom:1.5rem; }
         .fps-fill { height:100%; transition:all 0.5s; }
-        .fps-breakdown { display:grid; grid-template-columns:repeat(2,1fr); gap:1rem; }
+        .fps-breakdown { display:grid; grid-template-columns:repeat(3,1fr); gap:1rem; }
         .fps-breakdown > div { display:flex; justify-content:space-between; padding:1rem; background:rgba(255,255,255,0.05); border-radius:12px; }
+        .fps-breakdown .metric-box { cursor:pointer; transition:all 0.3s; position:relative; }
+        .fps-breakdown .metric-box:hover { background:rgba(129,140,248,0.15); transform:translateY(-2px); box-shadow:0 4px 12px rgba(129,140,248,0.3); }
+        .fps-breakdown .metric-box:hover::after { content:"ℹ️ Click for details"; position:absolute; bottom:-25px; left:50%; transform:translateX(-50%); font-size:0.75rem; color:#818cf8; white-space:nowrap; }
+        .explanation-modal { position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.8); display:flex; align-items:center; justify-content:center; z-index:1000; padding:2rem; }
+        .explanation-content { background:linear-gradient(135deg,#1e1b4b,#312e81); border:2px solid #818cf8; border-radius:24px; padding:2rem; max-width:600px; max-height:80vh; overflow-y:auto; position:relative; }
+        .explanation-content h3 { font-size:1.75rem; margin-bottom:1rem; color:#818cf8; }
+        .explanation-content p { margin-bottom:1rem; line-height:1.6; }
+        .explanation-content ul { margin-left:1.5rem; margin-bottom:1rem; }
+        .explanation-content li { margin-bottom:0.5rem; line-height:1.5; }
+        .explanation-content strong { color:#c4b5fd; }
+        .close-btn { position:absolute; top:1rem; right:1rem; background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); color:#fff; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1.25rem; display:flex; align-items:center; justify-content:center; transition:all 0.3s; }
+        .close-btn:hover { background:rgba(239,68,68,0.3); border-color:#ef4444; }
         .nav-cards { display:grid; grid-template-columns:repeat(2,1fr); gap:2rem; }
         .nav-card { background:rgba(255,255,255,0.05); border:2px solid rgba(129,140,248,0.2); border-radius:20px; padding:2rem; cursor:pointer; transition:all 0.4s; text-align:center; }
         .nav-card:hover { transform:translateY(-8px); border-color:rgba(129,140,248,0.6); }
         .nav-card svg { color:#818cf8; margin:0 auto 1rem; display: block; }
         .nav-card h3 { font-size:1.5rem; margin-bottom:0.5rem; }
         .nav-card p { color:rgba(255,255,255,0.7); }
-        .skill-map, .simulation { max-width:1000px; margin:0 auto; }
+        .skill-map { max-width:1100px; margin:0 auto; }
+        .simulation { max-width:1000px; margin:0 auto; }
         .map-header, .sim-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem; }
         .map-header h2, .sim-header h2 { font-size:2rem; font-weight:700; }
-        .map-header button, .sim-header button { background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); color:#fff; padding:0.75rem 1.5rem; border-radius:12px; cursor:pointer; }
-        .map-svg { width:100%; height:500px; background:rgba(255,255,255,0.02); border-radius:20px; padding:2rem; margin-bottom:2rem; }
-        .map-legend { display:flex; gap:2rem; justify-content:center; flex-wrap: wrap; }
-        .map-legend > div { display:flex; align-items:center; gap:0.5rem; }
-        .map-legend > div > div { width:20px; height:20px; border-radius:4px; }
+        .map-header button, .sim-header button { background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); color:#fff; padding:0.75rem 1.5rem; border-radius:12px; cursor:pointer; transition:all 0.3s; }
+        .map-header button:hover, .sim-header button:hover { background:rgba(255,255,255,0.15); transform:translateY(-2px); }
+
+        .filter-controls { display:flex; align-items:center; gap:1.5rem; margin-bottom:2rem; padding:1.5rem; background:rgba(255,255,255,0.03); border-radius:16px; border:1px solid rgba(129,140,248,0.1); }
+        .filter-label { font-size:0.95rem; font-weight:600; color:rgba(255,255,255,0.8); white-space:nowrap; }
+        .filter-buttons { display:flex; gap:0.75rem; flex-wrap:wrap; }
+        .filter-btn { padding:0.65rem 1.25rem; border-radius:10px; border:2px solid rgba(255,255,255,0.2); background:rgba(255,255,255,0.05); color:rgba(255,255,255,0.7); font-size:0.9rem; font-weight:600; cursor:pointer; transition:all 0.3s; white-space:nowrap; }
+        .filter-btn:hover { transform:translateY(-2px); background:rgba(255,255,255,0.1); box-shadow:0 4px 12px rgba(0,0,0,0.2); }
+        .filter-btn.active { background:rgba(129,140,248,0.15); border-color:#818cf8; color:#818cf8; box-shadow:0 4px 12px rgba(129,140,248,0.3); }
+
+        .category-labels { position:relative; height:50px; margin-bottom:1rem; }
+        .category-label { position:absolute; top:0; font-size:0.85rem; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; padding:0.5rem 1rem; border:1px solid; border-radius:8px; background:rgba(0,0,0,0.3); backdrop-filter:blur(10px); }
+
+        .map-svg { width:100%; height:750px; background:linear-gradient(135deg, rgba(15,12,41,0.6), rgba(48,43,99,0.4)); border:2px solid rgba(129,140,248,0.2); border-radius:24px; padding:1rem; margin-bottom:2rem; overflow:visible; }
+
+        .skill-node { transition:all 0.3s ease; }
+        .skill-node:hover { transform:scale(1.05); }
+        .skill-node .hover-overlay { transition:opacity 0.3s; }
+        .skill-node:hover .hover-overlay { opacity:1; }
+
+        .map-legend { display:flex; gap:2rem; justify-content:center; flex-wrap:wrap; margin-bottom:2rem; padding:1.5rem; background:rgba(255,255,255,0.03); border-radius:16px; border:1px solid rgba(129,140,248,0.1); }
+        .map-legend .legend-item { display:flex; align-items:center; gap:0.75rem; }
+        .map-legend .legend-dot { width:24px; height:24px; border-radius:6px; box-shadow:0 2px 8px rgba(0,0,0,0.3); }
+        .map-legend span { font-size:0.95rem; font-weight:500; }
+
+        .map-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:1.5rem; margin-top:2rem; }
+        .stat-card { background:linear-gradient(135deg, rgba(129,140,248,0.1), rgba(192,132,252,0.1)); border:2px solid rgba(129,140,248,0.3); border-radius:20px; padding:2rem; text-align:center; transition:all 0.3s; }
+        .stat-card:hover { transform:translateY(-4px); border-color:rgba(129,140,248,0.5); box-shadow:0 8px 24px rgba(129,140,248,0.2); }
+        .stat-value { font-size:3rem; font-weight:800; font-family:'Space Mono',monospace; background:linear-gradient(135deg,#818cf8,#c084fc); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:0.5rem; }
+        .stat-label { font-size:0.95rem; color:rgba(255,255,255,0.7); font-weight:500; }
         .scenarios { display:grid; gap:2rem; }
         .scenario-card { background:rgba(255,255,255,0.05); border:2px solid rgba(129,140,248,0.2); border-radius:20px; padding:2rem; cursor:pointer; transition:all 0.4s; }
         .scenario-card:hover { transform:translateY(-4px); border-color:rgba(129,140,248,0.6); }
@@ -1303,6 +2137,96 @@ const [completedNodes, setCompletedNodes] = useState([]);
           .training-grid {
             grid-template-columns: 1fr;
           }
+        }
+
+        .job-links { display:flex; flex-direction:column; gap:0.75rem; margin-top:1rem; }
+        .job-link { display:inline-block; padding:0.75rem 1.25rem; border-radius:12px; text-decoration:none; font-weight:600; transition:all 0.3s; border:2px solid; text-align:center; }
+        .job-link:hover { transform:translateY(-2px); box-shadow:0 4px 12px rgba(0,0,0,0.3); }
+        .job-link.linkedin { background:rgba(0,119,181,0.2); border-color:#0077b5; color:#0077b5; }
+        .job-link.linkedin:hover { background:rgba(0,119,181,0.3); }
+        .job-link.indeed { background:rgba(45,103,185,0.2); border-color:#2d67b9; color:#2d67b9; }
+        .job-link.indeed:hover { background:rgba(45,103,185,0.3); }
+        .job-link.glassdoor { background:rgba(13,161,58,0.2); border-color:#0da13a; color:#0da13a; }
+        .job-link.glassdoor:hover { background:rgba(13,161,58,0.3); }
+
+        @media (max-width: 1024px) {
+          .map-stats { grid-template-columns:1fr; }
+          .category-labels { display:none; }
+          .filter-controls { flex-direction:column; align-items:flex-start; gap:1rem; }
+          .filter-buttons { width:100%; }
+        }
+
+        /* Dynamic Training Studio Styles */
+        .training { max-width:1200px; margin:0 auto; }
+        .loading-state, .error-state { display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:400px; }
+        .spinner { width:60px; height:60px; border:4px solid rgba(129,140,248,0.2); border-top-color:#818cf8; border-radius:50%; animation:spin 1s linear infinite; margin-bottom:1rem; }
+
+        .training-hero { background:linear-gradient(135deg, rgba(129,140,248,0.2), rgba(192,132,252,0.2)); border:2px solid rgba(129,140,248,0.3); border-radius:20px; padding:2rem; margin-bottom:3rem; text-align:center; }
+        .training-hero h3 { font-size:1.75rem; line-height:1.4; color:#c4b5fd; margin-bottom:1.5rem; }
+
+        .progress-stats { margin-top:1.5rem; }
+        .progress-bar-container { width:100%; height:12px; background:rgba(255,255,255,0.1); border-radius:6px; overflow:hidden; margin-bottom:0.75rem; }
+        .progress-bar-fill { height:100%; background:linear-gradient(90deg, #10b981, #059669); transition:width 0.5s ease; border-radius:6px; }
+        .progress-text { font-size:1rem; color:rgba(255,255,255,0.8); font-weight:600; }
+
+        .quick-wins-section, .build-project-section, .resources-section, .challenges-section, .reflection-section { margin-bottom:3rem; }
+        .quick-wins-section h3, .build-project-section h3, .resources-section h3, .challenges-section h3, .reflection-section h3 { font-size:1.75rem; margin-bottom:1.5rem; }
+
+        .quick-wins-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:1.5rem; }
+        .quick-win-card { background:rgba(16,185,129,0.1); border:2px solid rgba(16,185,129,0.3); border-radius:16px; padding:1.5rem; position:relative; transition:all 0.3s; display:flex; align-items:flex-start; gap:1rem; }
+        .quick-win-card:hover { transform:translateY(-4px); border-color:rgba(16,185,129,0.5); box-shadow:0 8px 24px rgba(16,185,129,0.2); }
+        .quick-win-card.completed { background:rgba(16,185,129,0.2); border-color:rgba(16,185,129,0.6); opacity:0.8; }
+        .win-checkbox { width:20px; height:20px; cursor:pointer; accent-color:#10b981; flex-shrink:0; margin-top:0.25rem; }
+        .win-content { flex:1; }
+        .win-number { background:#10b981; color:#0f0c29; width:28px; height:28px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; font-weight:700; font-size:0.9rem; margin-right:0.5rem; }
+        .quick-win-card p { line-height:1.5; display:inline; }
+
+        .project-card { background:rgba(129,140,248,0.1); border:2px solid rgba(129,140,248,0.3); border-radius:20px; padding:2rem; transition:all 0.3s; }
+        .project-card.completed { background:rgba(129,140,248,0.2); border-color:rgba(129,140,248,0.6); }
+        .project-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:1rem; gap:1rem; flex-wrap:wrap; }
+        .project-card h4 { font-size:1.5rem; color:#818cf8; margin:0; }
+        .project-complete-btn { background:rgba(129,140,248,0.2); border:2px solid rgba(129,140,248,0.4); color:#fff; padding:0.5rem 1.25rem; border-radius:8px; font-weight:600; cursor:pointer; transition:all 0.3s; white-space:nowrap; }
+        .project-complete-btn:hover { background:rgba(129,140,248,0.3); border-color:rgba(129,140,248,0.6); }
+        .project-complete-btn.checked { background:#818cf8; border-color:#818cf8; }
+        .project-description { color:rgba(255,255,255,0.8); margin-bottom:1.5rem; line-height:1.6; }
+        .project-meta { display:flex; gap:1rem; margin-bottom:1.5rem; }
+        .project-meta span { background:rgba(255,255,255,0.1); padding:0.5rem 1rem; border-radius:8px; font-size:0.9rem; }
+        .project-steps { background:rgba(255,255,255,0.05); padding:1.5rem; border-radius:12px; }
+        .project-steps strong { display:block; margin-bottom:0.75rem; color:#c4b5fd; }
+        .project-steps ol { padding-left:1.5rem; }
+        .project-steps li { margin-bottom:0.75rem; line-height:1.5; }
+
+        .resources-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:1.5rem; }
+        .resource-card { display:flex; gap:1.5rem; background:rgba(255,255,255,0.05); border:2px solid rgba(255,255,255,0.1); border-radius:16px; padding:1.5rem; text-decoration:none; transition:all 0.3s; }
+        .resource-card:hover { transform:translateY(-4px); box-shadow:0 8px 24px rgba(0,0,0,0.3); }
+        .resource-card.youtube:hover { border-color:#ff0000; }
+        .resource-card.course:hover { border-color:#0056d2; }
+        .resource-card.practice:hover { border-color:#10b981; }
+        .resource-icon { font-size:2.5rem; flex-shrink:0; }
+        .resource-content { flex:1; }
+        .resource-content h4 { font-size:1.1rem; margin-bottom:0.5rem; color:#fff; }
+        .resource-creator { font-size:0.9rem; color:rgba(255,255,255,0.6); margin-bottom:0.5rem; }
+        .resource-meta { font-size:0.85rem; color:rgba(255,255,255,0.5); }
+
+        .challenges-list { display:grid; gap:1rem; }
+        .challenge-item { display:flex; align-items:flex-start; gap:1rem; background:rgba(251,191,36,0.1); border:2px solid rgba(251,191,36,0.3); border-radius:16px; padding:1.5rem; transition:all 0.3s; }
+        .challenge-item:hover { border-color:rgba(251,191,36,0.5); transform:translateX(8px); }
+        .challenge-item.completed { background:rgba(251,191,36,0.2); border-color:rgba(251,191,36,0.6); opacity:0.8; }
+        .challenge-checkbox { width:20px; height:20px; cursor:pointer; accent-color:#fbbf24; flex-shrink:0; margin-top:0.25rem; }
+        .challenge-content { flex:1; display:flex; gap:1rem; align-items:flex-start; }
+        .challenge-level { background:#fbbf24; color:#0f0c29; padding:0.5rem 1rem; border-radius:8px; font-weight:700; white-space:nowrap; flex-shrink:0; }
+        .challenge-item p { line-height:1.5; flex:1; }
+
+        .reflection-list { list-style:none; padding:0; }
+        .reflection-list li { background:rgba(192,132,252,0.1); border-left:4px solid #c084fc; padding:1.25rem 1.5rem; margin-bottom:1rem; border-radius:8px; line-height:1.6; }
+
+        .completion-section { text-align:center; padding:2rem; }
+        .complete-btn-large { background:linear-gradient(135deg, #10b981, #059669); border:none; color:#fff; padding:1.25rem 3rem; border-radius:16px; font-size:1.1rem; font-weight:700; cursor:pointer; transition:all 0.3s; box-shadow:0 8px 24px rgba(16,185,129,0.3); }
+        .complete-btn-large:hover { transform:translateY(-4px); box-shadow:0 12px 32px rgba(16,185,129,0.4); }
+
+        @media (max-width: 768px) {
+          .quick-wins-grid { grid-template-columns:1fr; }
+          .resources-grid { grid-template-columns:1fr; }
         }
 
       `}</style>
